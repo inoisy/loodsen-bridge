@@ -1,0 +1,21 @@
+[Unit]
+Description=Шлюз Time: только чтение, кэш, через мост с Мака
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=time-gw
+Group=time-gw
+ExecStart=/usr/local/bin/time-gw
+Restart=always
+RestartSec=5
+StateDirectory=time-gw
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/time-gw
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,132 @@
+#!/usr/bin/python3 -I
+"""Шлюз Time на Маке владельца: пароль не покидает Мак.
+
+Слушает 127.0.0.1:18490; мост (launchd com.example.sphere-bridge) пробрасывает его на сервер как
+127.0.0.1:18447, где его читает серверный time-gw (кэш, белый список). Здесь:
+- только чтение — белый список ALLOW (метод + путь), остальное 403;
+- токен Keycloak (realm <realm>, публичный клиент <client-id>, password grant) берётся сам,
+  пароль — из связки ключей (`security … -s company-time`), токен кэшируется на 240 с;
+- запрос уходит в https://<internal-host> с Bearer, ответ отдаётся как есть;
+  /core/… — в core Time (https://<internal-host>/…, внутренняя сеть Лоции): GET /core/logs —
+  все списания за период постранично, offset — номер страницы.
+- core ходит от имени сервиса, если в связке есть секрет служебного клиента `resource-planning`
+  (`security … -s resource-planning-time -a resource-planning`, client_credentials, scope TIME_READ; с 20.10.2026);
+  BFF (календарь — график конкретного пользователя) — по-прежнему учёткой владельца.
+"""
+import os, re, subprocess, threading, time, urllib.error, urllib.parse, urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+UPSTREAM = 'https://<internal-host>'
+CORE_UPSTREAM = 'https://<internal-host>'
+TOKEN_URL = 'https://<internal-host>/realms/<realm>/protocol/openid-connect/token'
+LOGIN = os.environ.get('TIME_LOGIN', '<email>')
+LISTEN = ('127.0.0.1', int(os.environ.get('TIME_GW_MAC_PORT', '18490')))
+TOKEN_TTL = 240
+ALLOW = [('POST', re.compile(r'^/bff/timesheet$')),
+         ('GET', re.compile(r'^/bff/timesheet/filter/[A-Za-z0-9_/-]+$')),
+         ('GET', re.compile(r'^/bff/timesheet/column$')),
+         ('GET', re.compile(r'^/bff/scope$')),
+         ('GET', re.compile(r'^/bff/v3/api-docs$')),
+         ('GET', re.compile(r'^/legacy/api/me/?$')),
+         ('GET', re.compile(r'^/core/logs$'))]
+
+
+def allowed(method, path):
+    p = urllib.parse.urlsplit(path).path
+    return '..' not in p and any(m == method and rx.match(p) for m, rx in ALLOW)
+
+
+def upstream_url(path):
+    return CORE_UPSTREAM + path[len('/core'):] if path.startswith('/core/') else UPSTREAM + path
+
+
+class Token:
+    def __init__(self, password=None):
+        self.value, self.at, self.lock = None, 0.0, threading.Lock()
+        self.password = password or (lambda: subprocess.run(
+            ['/usr/bin/security', 'find-generic-password', '-s', 'company-time', '-a', LOGIN, '-w'],
+            capture_output=True, text=True, check=True).stdout.strip())
+
+    def get(self, fresh=False):
+        with self.lock:
+            if fresh or not self.value or time.monotonic() - self.at > TOKEN_TTL:
+                body = urllib.parse.urlencode({'grant_type': 'password', 'client_id': '<client-id>',
+                                               'username': LOGIN, 'password': self.password()}).encode()
+                for attempt in range(3):  # Keycloak изредка отвечает unknown_error на валидный grant
+                    try:
+                        with urllib.request.urlopen(urllib.request.Request(TOKEN_URL, data=body), timeout=20) as r:
+                            import json
+                            self.value = json.loads(r.read())['access_token']; self.at = time.monotonic(); break
+                    except urllib.error.HTTPError:
+                        if attempt == 2: raise
+                        time.sleep(2)
+            return self.value
+
+
+class ServiceToken:
+    """Токен служебного клиента по client_credentials; секрет — из связки ключей, кэш до истечения минус минута."""
+    CLIENT = 'resource-planning'
+
+    def __init__(self, secret=None):
+        self.value, self.until, self.lock = None, 0.0, threading.Lock()
+        self.secret = secret or (lambda: subprocess.run(
+            ['/usr/bin/security', 'find-generic-password', '-s', 'resource-planning-time', '-a', self.CLIENT, '-w'],
+            capture_output=True, text=True, check=True).stdout.strip())
+
+    @classmethod
+    def available(cls):
+        return subprocess.run(['/usr/bin/security', 'find-generic-password', '-s', 'resource-planning-time', '-a', cls.CLIENT],
+                              capture_output=True).returncode == 0
+
+    def get(self, fresh=False):
+        with self.lock:
+            if fresh or not self.value or time.monotonic() > self.until:
+                import json
+                body = urllib.parse.urlencode({'grant_type': 'client_credentials', 'client_id': self.CLIENT,
+                                               'client_secret': self.secret()}).encode()
+                with urllib.request.urlopen(urllib.request.Request(TOKEN_URL, data=body), timeout=20) as r:
+                    data = json.loads(r.read())
+                self.value = data['access_token']
+                self.until = time.monotonic() + max(30, int(data.get('expires_in', 300)) - 60)
+            return self.value
+
+
+def make_handler(token, core_token=None):
+    class H(BaseHTTPRequestHandler):
+        server_version = 'time-gw-mac'
+
+        def _go(self, method):
+            if not allowed(method, self.path):
+                return self._send(403, b'{"error":"READ_ONLY"}')
+            n = int(self.headers.get('Content-Length') or 0)
+            body = self.rfile.read(n) if n else None
+            use = core_token if core_token and urllib.parse.urlsplit(self.path).path.startswith('/core/') else token
+            for fresh in (False, True):
+                req = urllib.request.Request(upstream_url(self.path), data=body, method=method,
+                                             headers={'Authorization': 'Bearer ' + use.get(fresh),
+                                                      'Content-Type': self.headers.get('Content-Type') or 'application/json',
+                                                      'Accept': 'application/json'})
+                try:
+                    with urllib.request.urlopen(req, timeout=60) as r:
+                        return self._send(r.status, r.read())
+                except urllib.error.HTTPError as e:
+                    if e.code == 401 and not fresh: continue
+                    return self._send(e.code, e.read())
+                except (urllib.error.URLError, OSError):
+                    return self._send(502, b'{"error":"TIME_UNREACHABLE"}')
+
+        def _send(self, status, data):
+            self.send_response(status); self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(data))); self.end_headers(); self.wfile.write(data)
+            print(f'{self.command} {urllib.parse.urlsplit(self.path).path} {status}', flush=True)
+
+        def do_GET(self): self._go('GET')
+        def do_POST(self): self._go('POST')
+        def log_message(self, *a): pass
+    return H
+
+
+if __name__ == '__main__':
+    core = ServiceToken() if ServiceToken.available() else None
+    print('core Time: ' + ('служебный клиент resource-planning' if core else 'учётка владельца'), flush=True)
+    ThreadingHTTPServer(LISTEN, make_handler(Token(), core)).serve_forever()

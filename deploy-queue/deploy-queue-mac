@@ -1,0 +1,180 @@
+#!/usr/bin/python3 -I
+"""Мак: разбор очереди проливки агентов (deploy-queue на сервере), 21.10.2026.
+
+launchd com.example.deploy-queue раз в 5 минут. Сервер не отвечает или git01 недоступен (Мак вне VPN) —
+выход без шума, очередь ждёт на сервере. API git01 — через glab владельца (GITLAB_HOST=<git01-host>).
+
+  mr       — открыть MR (или найти открытый) из ветки агента в базу. Не сливает: ревью — людям.
+  rp-prod  — сервис РП в прод без вопроса: MR main → dev, dev → prod, слить, нажать deploy_prod, дождаться.
+"""
+import json, os, subprocess, sys, time, urllib.parse
+
+VPS = os.environ.get("DQ_VPS", "root@<VPS>")
+GLAB = os.environ.get("DQ_GLAB", "/opt/homebrew/bin/glab")
+RP = 936  # <group>/<project>
+SPHERE = "https://<sphere-host>/company/personal/user/0/tasks/task/view/{}/"
+
+
+class Retry(Exception):
+    """Временная беда (сеть, ещё не готово) — элемент остаётся в очереди."""
+
+
+class Fail(Exception):
+    """Решение за человеком — элемент в failed с причиной."""
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+
+
+def vps(*args, timeout=300):
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "LogLevel=ERROR", VPS,
+                        "runuser -u agents -- /usr/local/bin/deploy-queue " + " ".join(map(sh_quote, args))],
+                       capture_output=True, text=True, timeout=timeout)
+    if r.returncode:
+        raise Retry(f"сервер: {(r.stderr or r.stdout).strip()[-300:]}")
+    return r.stdout
+
+
+def sh_quote(s):
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+
+def api(path, method="GET", **fields):
+    cmd = [GLAB, "api", "-X", method, path]
+    for k, v in fields.items():
+        cmd += ["-F" if isinstance(v, bool) else "-f", f"{k}={str(v).lower() if isinstance(v, bool) else v}"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                       env={**os.environ, "GITLAB_HOST": "<git01-host>", "NO_COLOR": "1"})
+    if r.returncode:
+        err = (r.stderr or r.stdout).strip()
+        if any(s in err for s in ("dial tcp", "no such host", "timeout", "connection refused", "EOF", "502", "503", "504")):
+            raise Retry(f"git01: {err[-200:]}")
+        raise Fail(f"{method} {path}: {err[-300:]}")
+    return json.loads(r.stdout) if r.stdout.strip() else None
+
+
+def q(s):
+    return urllib.parse.quote(str(s), safe="")
+
+
+def open_mr(project, source, target, title, description):
+    p = q(project)
+    found = api(f"projects/{p}/merge_requests?state=opened&source_branch={q(source)}&target_branch={q(target)}")
+    if found:
+        return found[0]
+    return api(f"projects/{p}/merge_requests", "POST", source_branch=source, target_branch=target,
+               title=title, description=description)
+
+
+def do_mr(it):
+    mr = open_mr(it["project"], it["branch"], it["target"], it["title"], it.get("description", ""))
+    return f"MR !{mr['iid']}", mr["web_url"]
+
+
+def behind(src, dst):
+    """Есть ли в src коммиты, которых нет в dst."""
+    return bool(api(f"projects/{RP}/repository/compare?from={q(dst)}&to={q(src)}")["commits"])
+
+
+def promote(src, dst, title, desc):
+    if not behind(src, dst):
+        return None
+    mr = open_mr(RP, src, dst, f"chore(merge): {src} в {dst} — {title}", desc)
+    for _ in range(40):  # GitLab считает, можно ли слить, не сразу после создания
+        st = api(f"projects/{RP}/merge_requests/{mr['iid']}")
+        status = st.get("detailed_merge_status") or st.get("merge_status")
+        if status in ("mergeable", "can_be_merged"):
+            break
+        if status in ("conflict", "cannot_be_merged", "broken_status", "need_rebase"):
+            raise Fail(f"MR !{mr['iid']} {src} → {dst}: {status} — слить руками")
+        time.sleep(3)
+    else:
+        raise Retry(f"MR !{mr['iid']} так и не стал mergeable")
+    # 422 «Branch cannot be merged» приходит, и когда слияние уже прошло (MR !50), и в первые секунды
+    # после создания при статусе mergeable (MR !56, 22.10.2026) — перечитать и повторить.
+    for attempt in range(6):
+        try:
+            api(f"projects/{RP}/merge_requests/{mr['iid']}/merge", "PUT")
+            break
+        except Fail:
+            if api(f"projects/{RP}/merge_requests/{mr['iid']}")["state"] == "merged":
+                break
+            if attempt == 5:
+                raise
+            time.sleep(10)
+    log(f"РП: MR !{mr['iid']} {src} → {dst} слит")
+    return mr["iid"]
+
+
+def deploy_prod():
+    """Дожать пайплайн вершины prod: build_prod → нажать ручной deploy_prod → дождаться."""
+    head = api(f"projects/{RP}/repository/commits/prod")["id"]
+    deadline = time.time() + 40 * 60
+    while time.time() < deadline:
+        pipes = api(f"projects/{RP}/pipelines?ref=prod&sha={head}&per_page=1")
+        if pipes:
+            pipe = pipes[0]
+            jobs = {j["name"]: j for j in api(f"projects/{RP}/pipelines/{pipe['id']}/jobs?per_page=50")}
+            build, dep = jobs.get("build_prod"), jobs.get("deploy_prod")
+            if build and build["status"] in ("failed", "canceled"):
+                raise Fail(f"build_prod {build['status']}: {build['web_url']}")
+            if dep:
+                if dep["status"] == "success":
+                    return head, dep["web_url"]
+                if dep["status"] in ("failed", "canceled"):
+                    raise Fail(f"deploy_prod {dep['status']}: {dep['web_url']}")
+                if dep["status"] == "manual" and build and build["status"] == "success":
+                    api(f"projects/{RP}/jobs/{dep['id']}/play", "POST")
+                    log(f"РП: deploy_prod нажат {dep['web_url']}")
+        time.sleep(20)
+    raise Retry("deploy_prod не закончился за 40 минут — проверю в следующий раз")
+
+
+def do_rp(it):
+    sha = it["sha"]
+    try:
+        api(f"projects/{RP}/repository/commits/{sha}")
+    except Fail:
+        raise Retry(f"{sha[:9]} ещё нет в git01 (rp-git01-sync не дошёл)")
+    if behind(sha, "main"):
+        raise Retry(f"main в git01 ещё не содержит {sha[:9]}")
+    title = "; ".join(it.get("titles") or ["правки main"])[:200]
+    task = it.get("task") or "12345"
+    title_t = f"{title}. T-{task}"
+    # Первая строка — ссылка на задачу Сферы; T-12345 — задачи нет, ссылку не ставим.
+    desc = (SPHERE.format(task) + "\n\n" if task != "12345" else "") + title + "."
+    promote("main", "dev", title_t, desc)
+    promote("dev", "prod", title_t, desc)
+    head, url = deploy_prod()
+    return f"в проде, prod {head[:9]}", url
+
+
+def main():
+    try:
+        queue = json.loads(vps("pull") or "[]")
+    except (Retry, subprocess.TimeoutExpired) as e:
+        log(f"сервер недоступен: {e}")
+        return
+    if not queue:
+        return
+    try:
+        api("version")
+    except (Retry, Fail) as e:
+        log(f"git01 недоступен, очередь ждёт ({len(queue)}): {e}")
+        return
+    for it in queue:
+        try:
+            note, url = (do_rp if it["kind"] == "rp-prod" else do_mr)(it)
+            vps("finish", it["id"], "--ok", "--note", note, *(["--url", url] if url else []),
+                *(["--sha", it["sha"]] if it["kind"] == "rp-prod" else []))
+            log(f"{it['id']}: {note} {url}")
+        except Retry as e:
+            log(f"{it['id']}: позже — {e}")
+        except Fail as e:
+            vps("finish", it["id"], "--fail", "--note", str(e)[:500])
+            log(f"{it['id']}: ошибка — {e}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,21 @@
+[Unit]
+Description=Шлюз Сферы: только чтение, кэш, через мост с Мака
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=sphere-gw
+Group=sphere-gw
+ExecStart=/usr/local/bin/sphere-gw
+Restart=always
+RestartSec=5
+StateDirectory=sphere-gw
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/sphere-gw
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=Мост к dev-контуру *.<dev-domain>: <internal-ip>:443 -> туннель с Мака 192.168.200.1:18450
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'for c in PREROUTING OUTPUT; do iptables -t nat -C $c -d <internal-ip>/32 -p tcp --dport 443 -j DNAT --to-destination 192.168.200.1:18450 2>/dev/null || iptables -t nat -I $c -d <internal-ip>/32 -p tcp --dport 443 -j DNAT --to-destination 192.168.200.1:18450; done'
+ExecStop=/bin/sh -c 'for c in PREROUTING OUTPUT; do iptables -t nat -D $c -d <internal-ip>/32 -p tcp --dport 443 -j DNAT --to-destination 192.168.200.1:18450 2>/dev/null || true; done'
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,262 @@
+#!/usr/bin/python3 -I
+"""Шлюз Сферы: единственная дорога сервера в Bitrix24 «Сфера» — только чтение, с кэшем.
+
+Клиенты (MCP sphere агентов, сервис ресурсного планирования, «Отпуска») ходят без ключа:
+    POST http://127.0.0.1:18480/rest/<профиль>/gw/<метод>[.json]
+Профиль — файл /etc/sphere-gw/keys/<профиль> с вебхуком `https://<sphere-host>/rest/<id>/<код>/`
+(кладёт владелец, root:sphere-gw 640). Шлюз подставляет ключ и идёт в Сферу через мост с Мака
+(SPHERE_UPSTREAM, по умолчанию https://<sphere-host>:18443).
+
+- Только методы из READ (у batch проверяется каждая подкоманда) — запись отбивается здесь, а не у клиентов.
+- Успешный ответ кэшируется (sqlite, ключ — профиль + метод + тело). Сфера или мост недоступны —
+  отдаётся последний ответ на тот же запрос с заголовком X-Sphere-Gw-Stale: <когда получен>; кэша нет — 503.
+- Не чаще одного запроса в MIN_INTERVAL на профиль (у Bitrix лимит ~2 rps на вебхук).
+- Вход из вкладки Сферы (локальное приложение): `POST /rest/app/<метод>` с `auth=<токен пользователя>` —
+  только APP_AUTH (`app.info`, `user.current`), без ключа профиля и без кэша: токен чужой и живёт минуты.
+- Свой API Сферы (`company.api`): `GET /api/<профиль>/v1/<ручка>/?…` — только ручки из API_READ, с логином
+  служебной учётки из /etc/sphere-gw/api/<профиль> (`логин:пароль`, кладёт владелец, root:sphere-gw 640); кэш — как у /rest.
+- Журнал — stdout (journalctl -u sphere-gw): клиент, профиль, метод, статус, источник, мс. Ключи не пишутся.
+"""
+import base64, hashlib, json, os, re, sqlite3, ssl, sys, threading, time, urllib.error, urllib.parse, urllib.request
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+KEYS = Path(os.environ.get('SPHERE_GW_KEYS', '/etc/sphere-gw/keys'))
+CACHE = Path(os.environ.get('SPHERE_GW_CACHE', '/var/lib/sphere-gw/cache.sqlite'))
+UPSTREAM = os.environ.get('SPHERE_UPSTREAM', 'https://<sphere-host>:18443').rstrip('/')
+LISTEN = os.environ.get('SPHERE_GW_LISTEN', '127.0.0.1:18480,192.168.200.1:18480')
+TIMEOUT = float(os.environ.get('SPHERE_GW_TIMEOUT', '25'))
+MIN_INTERVAL = float(os.environ.get('SPHERE_GW_MIN_INTERVAL', '0.5'))
+MAX_BODY = 1 << 20
+
+READ = frozenset('''
+ scope methods user.current user.get user.search user.fields user.userfield.list department.get
+ sonet_group.get sonet_group.user.get sonet_group.user.groups
+ tasks.task.get tasks.task.list tasks.task.getFields task.item.getdata task.item.list
+ task.commentitem.get task.commentitem.getlist task.elapseditem.get task.elapseditem.getlist
+ task.stages.get task.checklistitem.getlist
+'''.split())
+# Свой API Сферы (`company.api`, вход по логину и паролю служебной учётки) — только эти GET-ручки.
+API_READ = frozenset({
+    'v1/resources/cards', 'v1/resources/absences', 'v1/resources/planning/rateemployee',
+    'v1/resources/planning/rates', 'v1/resources/planning/rateprices', 'v1/resources/planning/projectrates',
+})
+API_KEYS = Path(os.environ.get('SPHERE_GW_API_KEYS', '/etc/sphere-gw/api'))
+API_PATH = re.compile(r'^/api/([^/]+)/(v1/[A-Za-z0-9_/]+?)/?$')
+APP_AUTH = frozenset({'app.info', 'user.current'})
+APP_PATH = re.compile(r'^/rest/app/([A-Za-z0-9_.]+?)(?:\.json)?$')
+PROFILE = re.compile(r'^[a-z0-9][a-z0-9-]{0,31}$')
+PATH = re.compile(r'^/rest/([^/]+)/gw/([A-Za-z0-9_.]+?)(?:\.json)?$')
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def batch_methods(params):
+    """Методы подкоманд batch: cmd[имя]=метод?параметры (форма) или {"cmd": {...}} (JSON)."""
+    cmd = params.get('cmd')
+    if isinstance(cmd, dict): values = cmd.values()
+    elif isinstance(cmd, list): values = cmd
+    else: values = [v for k, v in params.items() if k.startswith('cmd[')]
+    return [str(v).split('?', 1)[0].strip() for v in values]
+
+
+def parse_params(body, ctype):
+    if not body: return {}
+    if 'json' in ctype:
+        data = json.loads(body)
+        if not isinstance(data, dict): raise ValueError('ожидается объект')
+        return data
+    return {k: v[-1] for k, v in urllib.parse.parse_qs(body.decode(), keep_blank_values=True).items()}
+
+
+def allowed(method, params):
+    """Пусто — можно; иначе текст отказа."""
+    if method == 'batch':
+        subs = batch_methods(params)
+        if not subs: return 'batch без cmd'
+        bad = [m for m in subs if m not in READ]
+        return f'batch: запрещены {", ".join(sorted(set(bad)))}' if bad else ''
+    return '' if method in READ else f'метод {method} не входит в список чтения'
+
+
+class Cache:
+    def __init__(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(str(path), check_same_thread=False)
+        self.lock = threading.Lock()
+        self.db.execute('create table if not exists r (k text primary key, profile text, method text, at text, body blob)')
+
+    @staticmethod
+    def key(profile, method, body):
+        return hashlib.sha256(profile.encode() + b'\0' + method.encode() + b'\0' + body).hexdigest()
+
+    def put(self, k, profile, method, body):
+        with self.lock:
+            self.db.execute('insert or replace into r values (?,?,?,?,?)', (k, profile, method, now_iso(), body)); self.db.commit()
+
+    def get(self, k):
+        with self.lock:
+            row = self.db.execute('select at, body from r where k=?', (k,)).fetchone()
+        return row
+
+
+class Pacer:
+    def __init__(self, interval):
+        self.interval, self.last, self.lock = interval, {}, threading.Lock()
+
+    def wait(self, profile):
+        with self.lock:
+            t = time.monotonic(); start = max(t, self.last.get(profile, 0) + self.interval)
+            self.last[profile] = start
+        if start > t: time.sleep(start - t)
+
+
+def webhook_path(profile):
+    """Путь `/rest/<id>/<код>/` из файла профиля; хост в файле не важен — ходим в UPSTREAM."""
+    if not PROFILE.match(profile): return None
+    f = KEYS / profile
+    try: raw = f.read_text().strip()
+    except OSError: return None
+    p = urllib.parse.urlsplit(raw).path if '://' in raw else raw
+    return p if re.match(r'^/rest/[^/]+/[^/]+/$', p) else None
+
+
+def api_credentials(profile):
+    """`логин:пароль` служебной учётки из /etc/sphere-gw/api/<профиль> → значение заголовка Authorization."""
+    if not PROFILE.match(profile): return None
+    try: raw = (API_KEYS / profile).read_text().strip()
+    except OSError: return None
+    if ':' not in raw: return None
+    return 'Basic ' + base64.b64encode(raw.encode()).decode()
+
+
+class Gateway:
+    def __init__(self, cache=None, pacer=None, opener=None):
+        self.cache = cache or Cache(CACHE)
+        self.pacer = pacer or Pacer(MIN_INTERVAL)
+        self.opener = opener or urllib.request.build_opener(urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+
+    def handle(self, path, body, ctype, verb='POST'):
+        """→ (status, headers, body bytes, source) — source: upstream | stale | denied | error."""
+        app = APP_PATH.match(urllib.parse.urlsplit(path).path)
+        if app: return self.app_auth(app.group(1), body, ctype)
+        api = API_PATH.match(urllib.parse.urlsplit(path).path)
+        if api: return self.api_get(api.group(1), api.group(2), urllib.parse.urlsplit(path).query, verb)
+        m = PATH.match(urllib.parse.urlsplit(path).path)
+        if not m: return 404, {}, err('NOT_FOUND', 'ожидается /rest/<профиль>/gw/<метод>'), 'error', '-', '-'
+        profile, method = m.group(1), m.group(2)
+        try: params = parse_params(body, ctype)
+        except (ValueError, UnicodeDecodeError): return 400, {}, err('BAD_REQUEST', 'тело не разобрать'), 'error', profile, method
+        why = allowed(method, params)
+        if why: return 403, {}, err('READ_ONLY', why), 'denied', profile, method
+        hook = webhook_path(profile)
+        if not hook: return 503, {}, err('NO_KEY', f'профиль {profile}: ключ не задан'), 'error', profile, method
+        req = urllib.request.Request(f'{UPSTREAM}{hook}{method}.json', data=body or b'',
+                                     headers={'Content-Type': ctype or 'application/x-www-form-urlencoded'}, method='POST')
+        return self.through(req, profile, method, Cache.key(profile, method, body))
+
+    def through(self, req, profile, method, k):
+        """Запрос в Сферу: успех — в кэш; Сфера или мост недоступны — последний ответ из кэша с пометкой."""
+        self.pacer.wait(profile)
+        try:
+            with self.opener.open(req, timeout=TIMEOUT) as r:
+                data = r.read()
+            status = 200
+        except urllib.error.HTTPError as e:
+            data, status = e.read(), e.code
+            if status < 500 and status != 429:
+                return status, {}, data, 'upstream', profile, method  # ошибка Битрикса — клиенту как есть, не кэшируем
+        except (urllib.error.URLError, OSError, TimeoutError):
+            status, data = 0, b''
+        if status == 200 and ok_json(data):
+            self.cache.put(k, profile, method, data)
+            return 200, {}, data, 'upstream', profile, method
+        hit = self.cache.get(k)
+        if hit:
+            return 200, {'X-Sphere-Gw-Stale': hit[0]}, hit[1], 'stale', profile, method
+        return 503, {}, err('SPHERE_UNAVAILABLE', 'Сфера или мост с Мака недоступны, кэша для этого запроса нет'), 'error', profile, method
+
+    def api_get(self, profile, route, query, verb):
+        """GET к своему API Сферы с логином служебной учётки профиля; кэш и устаревший ответ — как у /rest."""
+        method = f'api:{route}'
+        if verb != 'GET' or route not in API_READ:
+            return 403, {}, err('READ_ONLY', f'{verb} /api/{route}: разрешены только GET {", ".join(sorted(API_READ))}'), 'denied', profile, method
+        auth = api_credentials(profile)
+        if not auth: return 503, {}, err('NO_KEY', f'профиль {profile}: учётка API не задана'), 'error', profile, method
+        req = urllib.request.Request(f'{UPSTREAM}/api/{route}/' + (f'?{query}' if query else ''),
+                                     headers={'Authorization': auth, 'Accept': 'application/json'}, method='GET')
+        return self.through(req, profile, method, Cache.key(profile, method, query.encode()))
+
+    def app_auth(self, method, body, ctype):
+        """Проверка токена пользователя локального приложения: сервис сам решает, его ли это приложение (app.info)."""
+        if method not in APP_AUTH: return 403, {}, err('READ_ONLY', f'{method}: для входа приложения только app.info и user.current'), 'denied', 'app', method
+        try: params = parse_params(body, ctype)
+        except (ValueError, UnicodeDecodeError): return 400, {}, err('BAD_REQUEST', 'тело не разобрать'), 'error', 'app', method
+        if not str(params.get('auth') or ''): return 400, {}, err('BAD_REQUEST', 'нет auth'), 'error', 'app', method
+        self.pacer.wait('app')
+        req = urllib.request.Request(f'{UPSTREAM}/rest/{method}.json', data=body,
+                                     headers={'Content-Type': ctype or 'application/x-www-form-urlencoded'}, method='POST')
+        try:
+            with self.opener.open(req, timeout=TIMEOUT) as r:
+                return 200, {}, r.read(), 'upstream', 'app', method
+        except urllib.error.HTTPError as e:
+            return e.code, {}, e.read(), 'upstream', 'app', method
+        except (urllib.error.URLError, OSError, TimeoutError):
+            return 503, {}, err('SPHERE_UNAVAILABLE', 'Сфера или мост с Мака недоступны'), 'error', 'app', method
+
+
+def ok_json(data):
+    try: return 'error' not in json.loads(data)
+    except ValueError: return False
+
+
+def err(code, text):
+    return json.dumps({'error': code, 'error_description': text}, ensure_ascii=False).encode()
+
+
+def make_handler(gw):
+    class H(BaseHTTPRequestHandler):
+        server_version = 'sphere-gw'
+
+        def _go(self, body, verb):
+            t = time.monotonic()
+            status, headers, data, source, profile, method = gw.handle(self.path, body, self.headers.get('Content-Type', ''), verb)
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('X-Sphere-Gw-Source', source)
+            for k, v in headers.items(): self.send_header(k, v)
+            self.send_header('Content-Length', str(len(data))); self.end_headers(); self.wfile.write(data)
+            print(f'{self.client_address[0]} {profile} {method} {status} {source} {int((time.monotonic() - t) * 1000)}ms', flush=True)
+
+        def do_POST(self):
+            n = int(self.headers.get('Content-Length') or 0)
+            if n > MAX_BODY: self.send_error(413); return
+            self._go(self.rfile.read(n) if n else b'', 'POST')
+
+        def do_GET(self):
+            q = urllib.parse.urlsplit(self.path).query
+            if self.path == '/health':
+                data = b'ok'; self.send_response(200); self.send_header('Content-Length', '2'); self.end_headers(); self.wfile.write(data); return
+            self._go(q.encode(), 'GET')
+
+        def log_message(self, *a): pass
+    return H
+
+
+def main():
+    gw = Gateway()
+    servers = []
+    for addr in LISTEN.split(','):
+        host, port = addr.rsplit(':', 1)
+        try: servers.append(ThreadingHTTPServer((host, int(port)), make_handler(gw)))
+        except OSError as e: print(f'не слушаю {addr}: {e}', file=sys.stderr, flush=True)
+    if not servers: sys.exit('ни одного адреса')
+    for s in servers[1:]: threading.Thread(target=s.serve_forever, daemon=True).start()
+    print(f'sphere-gw: {", ".join(f"{s.server_address[0]}:{s.server_address[1]}" for s in servers)} → {UPSTREAM}', flush=True)
+    servers[0].serve_forever()
+
+
+if __name__ == '__main__': main()

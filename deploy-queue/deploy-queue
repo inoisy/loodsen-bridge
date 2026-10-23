@@ -1,0 +1,255 @@
+#!/usr/bin/python3 -I
+"""Очередь проливки агентов на сервере (21.10.2026).
+
+git01 серверу виден только через мост с Мака: ssh (пуш) — пока Мак не спит и в VPN,
+HTTPS/API (MR, слияние, ручной деплой) — никогда. Поэтому агент не ждёт Мак, а кладёт работу сюда:
+
+  deploy-queue add mr --repo . --branch <ветка> --target <база> --title … --description-file f.md
+      ветка сохраняется в зеркале очереди (каталог агента можно удалять) и пушится в git01, как только
+      есть мост; MR откроет Мак.
+  deploy-queue add rp-prod [--sha <main>]
+      сервис РП: main → dev → prod и ручной deploy_prod. Ставит rp-git01-sync после каждого пуша main.
+
+Мак (deploy-queue/deploy-queue-mac, launchd) раз в 5 минут зовёт `pull` (сначала допушить ветки, затем
+отдать готовое к работе) и `finish`. Мак не ответил — элементы ждут здесь.
+"""
+import argparse, fcntl, json, os, re, secrets, subprocess, sys, time
+from contextlib import contextmanager
+
+DIR = os.environ.get("DQ_DIR", "/var/lib/deploy-queue")
+GIT = os.environ.get("DQ_GIT", "/usr/local/bin/git")  # обёртка git-guard: в базовые ветки агентам не пушить
+GIT01 = os.environ.get("DQ_GIT01", "git@<git01-host>:{project}.git")
+RP_REPO = os.environ.get("DQ_RP_REPO", "/home/agents/resource-planning/service")
+RP_PROJECT = "<group>/<project>"
+BASE = re.compile(r"^(main|master|dev|develop|stage|prod|release/.*)$")
+
+
+def log(msg):
+    subprocess.run(["logger", "-t", "deploy-queue", "--", msg], check=False)
+
+
+def git(*args, cwd=None, check=True):
+    r = subprocess.run([GIT, *args], cwd=cwd, capture_output=True, text=True, timeout=180)
+    if check and r.returncode:
+        raise SystemExit(f"git {' '.join(args)}: {(r.stderr or r.stdout).strip()}")
+    return r
+
+
+@contextmanager
+def locked():
+    os.makedirs(f"{DIR}/items", exist_ok=True)
+    with open(f"{DIR}/.lock", "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def items():
+    out = []
+    for name in sorted(os.listdir(f"{DIR}/items")):
+        if name.endswith(".json"):
+            with open(f"{DIR}/items/{name}") as f:
+                out.append(json.load(f))
+    return out
+
+
+def save(it):
+    it["updated"] = now()
+    tmp = f"{DIR}/items/.{it['id']}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(it, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, f"{DIR}/items/{it['id']}.json")
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def project_of(url):
+    m = re.match(r"^(?:ssh://)?git@<git01-host>[:/](.+?)(?:\.git)?/?$", url) \
+        or re.match(r"^https://<git01-host>/(.+?)(?:\.git)?/?$", url)
+    return m.group(1) if m else None
+
+
+def mirror(project):
+    path = f"{DIR}/git/{project.replace('/', '__')}.git"
+    if not os.path.isdir(path):
+        os.makedirs(path)
+        git("init", "-q", "--bare", path)
+    return path
+
+
+def task_of(text):
+    m = re.search(r"\bT-(\d+)\b", text or "")
+    return m.group(1) if m else "12345"
+
+
+def feature_title(subject):
+    """«feat(calendar): производственный календарь цепочкой. T-12345» → «производственный календарь цепочкой»."""
+    s = re.sub(r"^\w+(\([^)]*\))?!?:\s*", "", subject.strip())
+    return re.sub(r"\.?\s*T-\d+\s*$", "", s).strip(" .")
+
+
+def add_mr(a):
+    if BASE.match(a.branch):
+        raise SystemExit(f"{a.branch} — базовая ветка: в очередь кладётся только своя ветка")
+    url = git("remote", "get-url", "origin", cwd=a.repo).stdout.strip()
+    project = a.project or project_of(url)
+    if not project:
+        raise SystemExit(f"origin {url} — не git01; укажи --project <группа>/<репо>")
+    sha = git("rev-parse", "--verify", f"{a.branch}^{{commit}}", cwd=a.repo).stdout.strip()
+    desc = open(a.description_file).read() if a.description_file else (a.description or "")
+    if re.search(r"(?i)co-authored-by|generated with \[?(claude|codex)", f"{a.title}\n{desc}"):
+        raise SystemExit("в заголовке или описании MR — подпись ИИ; убери")
+    # Снимок ветки в зеркало очереди: рабочий каталог рана могут удалить раньше, чем появится мост.
+    git("push", "-q", "--force", mirror(project), f"{sha}:refs/heads/{a.branch}", cwd=a.repo)
+    with locked():
+        old = [i for i in items() if i["kind"] == "mr" and i["state"] in ("push", "ready")
+               and i["project"] == project and i["branch"] == a.branch]
+        it = old[0] if old else {"id": new_id("mr"), "kind": "mr", "created": now()}
+        it.update(project=project, branch=a.branch, target=a.target, sha=sha, title=a.title,
+                  description=desc, force=a.force, issue=a.issue or os.environ.get("MULTICA_ISSUE_KEY", ""),
+                  state="push", note="ждёт моста в git01")
+        save(it)
+    print(f"{it['id']}: {project} {a.branch} → {a.target} ({sha[:9]}) в очереди")
+    flush_one(it["id"])
+    show_id(it["id"])
+
+
+def add_rp(a):
+    sha = git("rev-parse", "--verify", f"{a.sha or 'main'}^{{commit}}", cwd=RP_REPO).stdout.strip()
+    # Вершина main — merge приёмки; суть правки — в теме второго родителя.
+    parents = git("log", "-1", "--format=%P", sha, cwd=RP_REPO).stdout.split()
+    subj = git("log", "-1", "--format=%s", parents[1] if len(parents) > 1 else sha, cwd=RP_REPO).stdout
+    title = a.title or feature_title(subj) or subj.strip()
+    task = a.task or task_of(subj)
+    with locked():
+        old = [i for i in items() if i["kind"] == "rp-prod" and i["state"] == "ready"]
+        it = old[0] if old else {"id": new_id("rp-prod"), "kind": "rp-prod", "created": now(), "titles": []}
+        if title not in it["titles"]:
+            it["titles"].append(title)
+        if it.get("task", "12345") == "12345":
+            it["task"] = task
+        # Новый main содержит прежний: одна выкатка вместо нескольких.
+        it.update(project=RP_PROJECT, sha=sha, state="ready", note="ждёт Мак: main → dev → prod")
+        save(it)
+    print(f"{it['id']}: РП {sha[:9]} в прод — в очереди ({'; '.join(it['titles'])})")
+
+
+def new_id(kind):
+    return f"{time.strftime('%Y%m%d-%H%M%S')}-{kind}-{secrets.token_hex(2)}"
+
+
+def flush_one(item_id):
+    """Пуш ветки из зеркала в git01. Нет моста — элемент ждёт следующей попытки."""
+    with locked():
+        it = next((i for i in items() if i["id"] == item_id), None)
+        if not it or it["state"] != "push":
+            return
+        r = git("push", "-q", *(["--force"] if it.get("force") else []), GIT01.format(project=it["project"]),
+                f"refs/heads/{it['branch']}:refs/heads/{it['branch']}", cwd=mirror(it["project"]), check=False)
+        err = (r.stderr or r.stdout).strip()
+        if r.returncode == 0:
+            it.update(state="ready", note="ветка в git01, MR откроет Мак")
+            log(f"{it['id']}: {it['project']} {it['branch']} → git01")
+        elif re.search(r"non-fast-forward|fetch first|rejected", err):
+            it.update(state="failed", note=f"git01 отклонил пуш (ветка ушла вперёд?): {err[-300:]}. "
+                                           "Перебазируй и положи снова; перезаписать — add mr … --force")
+            log(f"{it['id']}: пуш отклонён")
+        else:
+            it.update(note=f"нет моста в git01, повтор позже: {err[-200:]}", tries=it.get("tries", 0) + 1)
+        save(it)
+
+
+def cmd_flush(_a):
+    for it in items() if os.path.isdir(f"{DIR}/items") else []:
+        if it["state"] == "push":
+            flush_one(it["id"])
+
+
+def cmd_pull(a):
+    cmd_flush(a)
+    print(json.dumps([i for i in items() if i["state"] == "ready"], ensure_ascii=False))
+
+
+def cmd_finish(a):
+    with locked():
+        it = next((i for i in items() if i["id"] == a.id), None)
+        if not it:
+            raise SystemExit(f"нет элемента {a.id}")
+        if it["state"] != "ready":
+            raise SystemExit(f"{a.id} уже {it['state']}")
+        if a.sha and it.get("sha") != a.sha:  # пока Мак работал, в очередь лёг новый main — остаётся ready
+            it["note"] = f"выкачен {a.sha[:9]}, в очереди уже {it['sha'][:9]}"
+        else:
+            it["state"] = "done" if a.ok else "failed"
+            it["note"] = a.note or it["note"]
+        if a.url:
+            it["url"] = a.url
+        it.setdefault("history", []).append({"at": now(), "ok": a.ok, "note": a.note, "url": a.url, "sha": a.sha})
+        save(it)
+    log(f"{a.id}: {'готово' if a.ok else 'ошибка'} — {a.note} {a.url or ''}")
+
+
+def show_id(item_id):
+    it = next(i for i in items() if i["id"] == item_id)
+    print(fmt(it))
+
+
+def fmt(it):
+    what = (f"{it['project']} {it['branch']} → {it['target']}" if it["kind"] == "mr"
+            else f"РП {it['sha'][:9]} в прод: {'; '.join(it.get('titles', []))}")
+    return f"{it['id']}  {it['state']:<6}  {what}\n    {it.get('note', '')}{'  ' + it['url'] if it.get('url') else ''}"
+
+
+def cmd_list(a):
+    rows = [i for i in items() if a.all or i["state"] in ("push", "ready")] if os.path.isdir(f"{DIR}/items") else []
+    if a.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=1))
+    else:
+        print("\n".join(fmt(i) for i in rows) or "очередь пуста")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="deploy-queue", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    add = sub.add_parser("add").add_subparsers(dest="kind", required=True)
+    mr = add.add_parser("mr", help="своя ветка в git01 и MR в базу")
+    mr.add_argument("--repo", default=".")
+    mr.add_argument("--branch", required=True)
+    mr.add_argument("--target", required=True)
+    mr.add_argument("--title", required=True)
+    mr.add_argument("--description")
+    mr.add_argument("--description-file")
+    mr.add_argument("--project", help="группа/репо в git01, если origin не git01")
+    mr.add_argument("--issue", help="ключ задачи multica")
+    mr.add_argument("--force", action="store_true", help="перезаписать ветку в git01 (после rebase)")
+    mr.set_defaults(fn=add_mr)
+    rp = add.add_parser("rp-prod", help="сервис РП: main → dev → prod")
+    rp.add_argument("--sha")
+    rp.add_argument("--title")
+    rp.add_argument("--task")
+    rp.set_defaults(fn=add_rp)
+    ls = sub.add_parser("list")
+    ls.add_argument("--all", action="store_true")
+    ls.add_argument("--json", action="store_true")
+    ls.set_defaults(fn=cmd_list)
+    sh = sub.add_parser("show")
+    sh.add_argument("id")
+    sh.set_defaults(fn=lambda a: show_id(a.id))
+    sub.add_parser("flush").set_defaults(fn=cmd_flush)
+    sub.add_parser("pull").set_defaults(fn=cmd_pull)
+    fin = sub.add_parser("finish")
+    fin.add_argument("id")
+    g = fin.add_mutually_exclusive_group(required=True)
+    g.add_argument("--ok", action="store_true")
+    g.add_argument("--fail", action="store_true")
+    fin.add_argument("--note", default="")
+    fin.add_argument("--url")
+    fin.add_argument("--sha", help="какой sha выкачен (rp-prod)")
+    fin.set_defaults(fn=cmd_finish)
+    a = p.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
