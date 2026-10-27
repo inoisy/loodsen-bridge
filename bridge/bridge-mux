@@ -1,0 +1,343 @@
+#!/usr/bin/python3 -I
+"""Мосты в рабочую сеть от нескольких людей сразу: кто онлайн, через того и ходим.
+
+Сервер в рабочую сеть (Сфера, Keycloak, git01, dev-контур) сам не ходит — туда ведут обратные
+SSH-туннели с машин сотрудников под VPN (пользователь `bridge`). Раньше слот был один: туннель
+держал один человек на постоянных портах (18443…), второй мог только выбить первого.
+
+Теперь у каждого свой слот портов: слот N, сервис со смещением K → 127.0.0.1:(20000 + 100·N + K).
+`bridge-mux serve` слушает постоянные адреса (их знают клиенты, NAT-юниты и ssh_config) и каждое
+соединение отдаёт первому живому слоту в порядке users из конфига. Живость — проба раз в PROBE_EVERY:
+TLS-рукопожатие, SSH-баннер или HTTP-ответ сквозь туннель, так что подвисший туннель (порт слушает,
+а машина уснула) тоже считается мёртвым.
+
+Конфиг /etc/bridge-mux.json (BRIDGE_MUX_CONFIG): {"users": [{"name", "slot", "key", "services"}]},
+порядок users — приоритет. authorized_keys пользователя `bridge` собирается из него же:
+    bridge-mux user add <имя> <файл .pub> [--services sphere,kc,git01,dev]   # слот — следующий свободный
+    bridge-mux user rm <имя>
+    bridge-mux client <имя> [--format ssh|plist|systemd]                     # что запустить у сотрудника
+    bridge-mux status                                                        # слоты и их живость сейчас
+"""
+import argparse, asyncio, json, os, pwd, re, socket, ssl, sys, time
+from pathlib import Path
+from xml.sax.saxutils import escape
+
+CONFIG = Path(os.environ.get('BRIDGE_MUX_CONFIG', '/etc/bridge-mux.json'))
+AUTH_KEYS = Path(os.environ.get('BRIDGE_AUTH_KEYS', '/var/lib/bridge/.ssh/authorized_keys'))
+SERVER = os.environ.get('BRIDGE_SERVER', 'bridge@<VPS>')
+PROBE_EVERY = float(os.environ.get('BRIDGE_MUX_PROBE_EVERY', '20'))
+PROBE_TIMEOUT = float(os.environ.get('BRIDGE_MUX_PROBE_TIMEOUT', '6'))
+CONNECT_TIMEOUT = 3.0
+BASE = 20000
+
+# offset — смещение порта в слоте; listen — постоянные адреса на сервере; target — куда ведёт туннель
+# с машины сотрудника; probe — как проверить, что за туннелем живой сервис.
+SERVICES = {
+    # 18443 отдан старым клиентам (LEGACY), sphere-gw ходит в bridge-mux на 18543.
+    'sphere': dict(offset=43, listen=['127.0.0.1:18543', '192.168.200.1:18543'],
+                   target='<sphere-host>:443', probe=('tls', '<sphere-host>')),
+    'kc':     dict(offset=44, listen=['127.0.0.1:18444', '192.168.200.1:18444'],
+                   target='<sso-host>:443', probe=('tls', '<sso-host>')),
+    'git01':  dict(offset=22, listen=['127.0.0.1:18422'],
+                   target='<git01-host>:22', probe=('ssh', None)),
+    'dev':    dict(offset=50, listen=['192.168.200.1:18450'],
+                   target='<internal-ip>:443', probe=('tls', '<internal-host>')),
+    # time-gw-mac живёт только на Маке владельца (пароль Time в его связке ключей) — остальным не нужен.
+    'time':   dict(offset=47, listen=['127.0.0.1:18447'],
+                   target='127.0.0.1:18490', probe=('http', None)),
+}
+DEFAULT_SERVICES = ['sphere', 'kc', 'git01', 'dev']
+# Старый клиент (до слотов) держит `-R 127.0.0.1:18443 -R 192.168.200.1:18443` → Сфера. Чтобы не ждать,
+# пока человек поменяет у себя команду, его пускают на эти адреса как есть: `"legacy": true` в конфиге.
+LEGACY = {'sphere': [('127.0.0.1', 18443), ('192.168.200.1', 18443)]}
+NAME = re.compile(r'^[a-z][a-z0-9-]{0,31}$')
+KEY = re.compile(r'^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/=]+$')
+
+
+def log(*a):
+    print(time.strftime('%Y-%m-%d %H:%M:%S'), *a, flush=True)
+
+
+def slot_port(slot, service):
+    return BASE + 100 * slot + SERVICES[service]['offset']
+
+
+def user_port(user, service):
+    """Порт сервиса у человека. legacy — клиент ещё по-старому держит постоянный порт сам (LEGACY)."""
+    if user.get('legacy'): return LEGACY[service][0][1]
+    return slot_port(user['slot'], service)
+
+
+def load_config(path=None):
+    path = path or CONFIG
+    if not path.exists(): return {'users': []}
+    cfg = json.loads(path.read_text())
+    for u in cfg['users']:
+        bad = set(u['services']) - set(LEGACY if u.get('legacy') else SERVICES)
+        if bad: raise ValueError(f'{u["name"]}: неизвестные сервисы {sorted(bad)}')
+    return cfg
+
+
+def save_config(cfg, path=None):
+    path = path or CONFIG
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + '\n')
+    os.chmod(tmp, 0o644); os.replace(tmp, path)
+
+
+def auth_line(user):
+    """Строка authorized_keys: слушать можно только порты своего слота и только на 127.0.0.1."""
+    opts = ['restrict', 'port-forwarding']
+    if user.get('legacy'):
+        opts += [f'permitlisten="{h}:{p}"' for s in user['services'] for h, p in LEGACY[s]]
+    else:
+        opts += [f'permitlisten="127.0.0.1:{user_port(user, s)}"' for s in user['services']]
+    opts.append('command="/usr/sbin/nologin"')
+    return f'{",".join(opts)} {user["key"]} bridge:{user["name"]}'
+
+
+def write_auth_keys(cfg, path=None):
+    path = path or AUTH_KEYS
+    body = '# Собирается из /etc/bridge-mux.json командой bridge-mux — руками не править.\n'
+    body += ''.join(auth_line(u) + '\n' for u in cfg['users'])
+    tmp = path.with_name(path.name + '.tmp')
+    tmp.write_text(body); os.chmod(tmp, 0o600)
+    try:
+        pw = pwd.getpwnam('bridge'); os.chown(tmp, pw.pw_uid, pw.pw_gid)
+    except (KeyError, PermissionError):
+        pass
+    os.replace(tmp, path)
+
+
+def add_user(cfg, name, key, services):
+    if not NAME.match(name): raise ValueError(f'имя «{name}»: латиница, цифры, дефис')
+    key = ' '.join(key.split()[:2])
+    if not KEY.match(key): raise ValueError('ключ: ожидается публичный ключ OpenSSH (ssh-ed25519 AAAA…)')
+    if any(u['name'] == name for u in cfg['users']): raise ValueError(f'«{name}» уже есть')
+    if any(u['key'] == key for u in cfg['users']): raise ValueError('этот ключ уже у другого пользователя')
+    bad = set(services) - set(SERVICES)
+    if bad: raise ValueError(f'неизвестные сервисы {sorted(bad)}; есть {sorted(SERVICES)}')
+    used = {u['slot'] for u in cfg['users']}
+    slot = next(n for n in range(1, 100) if n not in used)
+    user = {'name': name, 'slot': slot, 'key': key, 'services': list(services)}
+    cfg['users'].append(user)
+    return user
+
+
+def remove_user(cfg, name):
+    before = len(cfg['users'])
+    cfg['users'] = [u for u in cfg['users'] if u['name'] != name]
+    if len(cfg['users']) == before: raise ValueError(f'«{name}» нет')
+
+
+def set_legacy(cfg, name, on):
+    user = next((u for u in cfg['users'] if u['name'] == name), None)
+    if not user: raise ValueError(f'«{name}» нет')
+    if on and any(u.get('legacy') for u in cfg['users'] if u is not user):
+        raise ValueError('постоянный 18443 уже у другого — двое на одном порту не встанут')
+    user['legacy'] = on
+    user['services'] = list(LEGACY) if on else list(DEFAULT_SERVICES)
+    if not on: del user['legacy']
+
+
+def candidates(cfg, service, healthy):
+    """Порты слотов для сервиса: сначала живые по пробе, потом остальные — всё в порядке приоритета."""
+    ports = [user_port(u, service) for u in cfg['users'] if service in u['services']]
+    return [p for p in ports if healthy.get(p)] + [p for p in ports if not healthy.get(p)]
+
+
+async def probe(port, kind, sni):
+    """Живой ли сервис за портом слота: порт может слушать sshd, а машина сотрудника — спать."""
+    async def go():
+        if kind == 'tls':
+            ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+            r, w = await asyncio.open_connection('127.0.0.1', port, ssl=ctx, server_hostname=sni)
+        else:
+            r, w = await asyncio.open_connection('127.0.0.1', port)
+        try:
+            if kind == 'http':
+                w.write(b'HEAD / HTTP/1.0\r\n\r\n'); await w.drain()
+            if kind != 'tls':
+                data = await r.read(4)
+                if not data or (kind == 'ssh' and data != b'SSH-'): raise OSError('пустой ответ')
+        finally:
+            w.close()
+    try:
+        await asyncio.wait_for(go(), PROBE_TIMEOUT)
+        return True
+    except (OSError, asyncio.TimeoutError, ssl.SSLError):
+        return False
+
+
+async def probe_all(cfg):
+    jobs = {}
+    for u in cfg['users']:
+        for s in u['services']:
+            kind, sni = SERVICES[s]['probe']
+            jobs[user_port(u, s)] = probe(user_port(u, s), kind, sni)
+    results = await asyncio.gather(*jobs.values())
+    return dict(zip(jobs, results))
+
+
+async def pipe(r, w):
+    try:
+        while data := await r.read(65536):
+            w.write(data); await w.drain()
+    except (OSError, asyncio.CancelledError):
+        pass
+    finally:
+        try: w.close()
+        except OSError: pass
+
+
+class Mux:
+    def __init__(self, path=None):
+        self.path, self.healthy, self.mtime, self.last = path or CONFIG, {}, None, {}
+        self.cfg = {'users': []}
+        self.reload()
+
+    def reload(self):
+        try:
+            mtime = self.path.stat().st_mtime if self.path.exists() else 0
+            if mtime != self.mtime:
+                self.cfg, self.mtime = load_config(self.path), mtime
+                log('конфиг:', ', '.join(f'{u["name"]}=слот {u["slot"]}' for u in self.cfg['users']) or 'пусто')
+        except (ValueError, OSError) as e:
+            log('конфиг не читается, работаю на прежнем:', e)
+
+    def owner(self, port):
+        return next((u['name'] for u in self.cfg['users'] for s in u['services']
+                     if user_port(u, s) == port), str(port))
+
+    async def watch(self):
+        while True:
+            self.reload()
+            new = await probe_all(self.cfg)
+            for port, ok in new.items():
+                if self.healthy.get(port) != ok:
+                    log('слот', self.owner(port), port, 'жив' if ok else 'не отвечает')
+            self.healthy = new
+            await asyncio.sleep(PROBE_EVERY)
+
+    async def handle(self, service, cr, cw):
+        for port in candidates(self.cfg, service, self.healthy):
+            try:
+                ur, uw = await asyncio.wait_for(asyncio.open_connection('127.0.0.1', port), CONNECT_TIMEOUT)
+            except (OSError, asyncio.TimeoutError):
+                self.healthy[port] = False
+                continue
+            if self.last.get(service) != port:
+                log(service, '→', self.owner(port)); self.last[service] = port
+            await asyncio.gather(pipe(cr, uw), pipe(ur, cw))
+            return
+        if self.last.get(service) is not None:
+            log(service, '→ никого: ни один мост не онлайн'); self.last[service] = None
+        cw.close()
+
+    async def serve(self):
+        servers = []
+        for name, svc in SERVICES.items():
+            for addr in svc['listen']:
+                host, port = addr.rsplit(':', 1)
+                servers.append(await asyncio.start_server(
+                    lambda r, w, s=name: self.handle(s, r, w), host, int(port), reuse_address=True))
+                log('слушаю', addr, '→', name)
+        await self.watch()
+
+
+def client_args(user, key_path):
+    args = ['/usr/bin/ssh', '-N', '-i', key_path, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes',
+            '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3',
+            '-o', 'StrictHostKeyChecking=accept-new']
+    for s in user['services']:
+        args += ['-R', f'127.0.0.1:{user_port(user, s)}:{SERVICES[s]["target"]}']
+    return args + [SERVER]
+
+
+def render_client(user, fmt, key_path):
+    """Команда моста у сотрудника. `~/` в ключе: systemd раскрывает %h, launchd — ничего, поэтому через sh."""
+    if fmt == 'systemd':
+        key_path = key_path.replace('~/', '%h/', 1)
+        return ('[Unit]\nDescription=Мост в рабочую сеть для агентов multica\nAfter=network-online.target\n\n'
+                f'[Service]\nExecStart={" ".join(client_args(user, key_path))}\n'
+                'Restart=always\nRestartSec=30\n\n[Install]\nWantedBy=default.target\n')
+    if fmt == 'ssh':
+        return ' '.join(client_args(user, key_path)) + '\n'
+    if fmt == 'windows':
+        args = ['ssh'] + client_args(user, key_path.replace('~/', '$env:USERPROFILE\\.ssh\\', 1)
+                                    .replace('.ssh\\.ssh/', '.ssh\\'))[1:]
+        return ('# Мост в рабочую сеть для агентов multica. Держит туннель и переподключается сам.\n'
+                'while ($true) {\n    & ' + ' '.join(f'"{a}"' if '$' in a else a for a in args) + '\n'
+                '    Start-Sleep -Seconds 30\n}\n')
+    cmd = 'exec ' + ' '.join(client_args(user, key_path.replace('~/', '"$HOME"/', 1)))
+    items = ''.join(f'    <string>{escape(a)}</string>\n' for a in ['/bin/sh', '-c', cmd])
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            '<plist version="1.0">\n<dict>\n  <key>Label</key><string>com.company.multica-bridge</string>\n'
+            f'  <key>ProgramArguments</key>\n  <array>\n{items}  </array>\n'
+            '  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n'
+            '  <key>ThrottleInterval</key><integer>30</integer>\n'
+            '  <key>StandardErrorPath</key><string>/tmp/multica-bridge.log</string>\n</dict>\n</plist>\n')
+
+
+def active(cfg, healthy):
+    """Через чей мост сейчас идёт каждый сервис (первый живой по приоритету), None — ни через чей."""
+    out = {}
+    for s in SERVICES:
+        live = [u['name'] for u in cfg['users'] if s in u['services'] and healthy.get(user_port(u, s))]
+        out[s] = live[0] if live else None
+    return out
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog='bridge-mux', description=__doc__.split('\n')[0])
+    sub = p.add_subparsers(dest='cmd', required=True)
+    sub.add_parser('serve')
+    sub.add_parser('status')
+    pu = sub.add_parser('user'); su = pu.add_subparsers(dest='op', required=True)
+    a = su.add_parser('add'); a.add_argument('name'); a.add_argument('keyfile')
+    a.add_argument('--services', default=','.join(DEFAULT_SERVICES))
+    r = su.add_parser('rm'); r.add_argument('name')
+    lg = su.add_parser('legacy', help='старый клиент на 18443 (только Сфера) или назад на слот')
+    lg.add_argument('name'); lg.add_argument('state', choices=['on', 'off'])
+    su.add_parser('list')
+    c = sub.add_parser('client'); c.add_argument('name')
+    c.add_argument('--format', choices=['ssh', 'plist', 'systemd', 'windows'], default='ssh')
+    c.add_argument('--key', default='~/.ssh/id_ed25519_multica_bridge', help='путь к приватному ключу у сотрудника')
+    args = p.parse_args(argv)
+
+    if args.cmd == 'serve':
+        asyncio.run(Mux().serve()); return 0
+    cfg = load_config()
+    if args.cmd == 'status':
+        healthy = asyncio.run(probe_all(cfg))
+        for i, u in enumerate(cfg['users'], 1):
+            marks = ' '.join(f'{s}:{"ok" if healthy[user_port(u, s)] else "—"}' for s in u['services'])
+            print(f'{i}. {u["name"]:<12} слот {u["slot"]:<2} {marks}')
+        for s, who in active(cfg, healthy).items():
+            print(f'   {s:<7}→ {who or "никого"}')
+        return 0
+    if args.cmd == 'client':
+        user = next((u for u in cfg['users'] if u['name'] == args.name), None)
+        if not user: print(f'«{args.name}» нет', file=sys.stderr); return 1
+        sys.stdout.write(render_client(user, args.format, args.key)); return 0
+    try:
+        if args.op == 'list':
+            for u in cfg['users']: print(u['name'], u['slot'], ','.join(u['services']), u['key'][:30] + '…')
+            return 0
+        if args.op == 'add':
+            user = add_user(cfg, args.name, Path(args.keyfile).read_text().strip(), args.services.split(','))
+            print(f'{user["name"]}: слот {user["slot"]}, порты',
+                  ', '.join(f'{s}={user_port(user, s)}' for s in user['services']))
+        elif args.op == 'legacy':
+            set_legacy(cfg, args.name, args.state == 'on')
+        else:
+            remove_user(cfg, args.name)
+    except ValueError as e:
+        print(e, file=sys.stderr); return 1
+    save_config(cfg); write_auth_keys(cfg)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -11,16 +11,14 @@
     <string>-o</string><string>IdentitiesOnly=yes</string>
     <string>-o</string><string>BatchMode=yes</string>
     <string>-o</string><string>ExitOnForwardFailure=yes</string>
-    <string>-o</string><string>ServerAliveInterval=20</string>
+    <string>-o</string><string>ServerAliveInterval=15</string>
     <string>-o</string><string>ServerAliveCountMax=3</string>
     <string>-o</string><string>StrictHostKeyChecking=accept-new</string>
-    <string>-R</string><string>127.0.0.1:18443:<sphere-host>:443</string>
-    <string>-R</string><string>192.168.200.1:18443:<sphere-host>:443</string>
-    <string>-R</string><string>127.0.0.1:18447:127.0.0.1:18490</string>
-    <string>-R</string><string>127.0.0.1:18444:<sso-host>:443</string>
-    <string>-R</string><string>192.168.200.1:18444:<sso-host>:443</string>
-    <string>-R</string><string>127.0.0.1:18422:<git01-host>:22</string>
-    <string>-R</string><string>192.168.200.1:18450:<internal-ip>:443</string>
+    <string>-R</string><string>127.0.0.1:20243:<sphere-host>:443</string>
+    <string>-R</string><string>127.0.0.1:20244:<sso-host>:443</string>
+    <string>-R</string><string>127.0.0.1:20222:<git01-host>:22</string>
+    <string>-R</string><string>127.0.0.1:20250:<internal-ip>:443</string>
+    <string>-R</string><string>127.0.0.1:20247:127.0.0.1:18490</string>
     <string>bridge@<VPS></string>
   </array>
   <key>RunAtLoad</key><true/>

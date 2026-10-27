@@ -5,7 +5,7 @@
     POST http://127.0.0.1:18480/rest/<профиль>/gw/<метод>[.json]
 Профиль — файл /etc/sphere-gw/keys/<профиль> с вебхуком `https://<sphere-host>/rest/<id>/<код>/`
 (кладёт владелец, root:sphere-gw 640). Шлюз подставляет ключ и идёт в Сферу через мост с Мака
-(SPHERE_UPSTREAM, по умолчанию https://<sphere-host>:18443).
+(SPHERE_UPSTREAM, по умолчанию https://<sphere-host>:18543 — bridge-mux).
 
 - Только методы из READ (у batch проверяется каждая подкоманда) — запись отбивается здесь, а не у клиентов.
 - Успешный ответ кэшируется (sqlite, ключ — профиль + метод + тело). Сфера или мост недоступны —
@@ -24,7 +24,7 @@ from pathlib import Path
 
 KEYS = Path(os.environ.get('SPHERE_GW_KEYS', '/etc/sphere-gw/keys'))
 CACHE = Path(os.environ.get('SPHERE_GW_CACHE', '/var/lib/sphere-gw/cache.sqlite'))
-UPSTREAM = os.environ.get('SPHERE_UPSTREAM', 'https://<sphere-host>:18443').rstrip('/')
+UPSTREAM = os.environ.get('SPHERE_UPSTREAM', 'https://<sphere-host>:18543').rstrip('/')
 LISTEN = os.environ.get('SPHERE_GW_LISTEN', '127.0.0.1:18480,192.168.200.1:18480')
 TIMEOUT = float(os.environ.get('SPHERE_GW_TIMEOUT', '25'))
 MIN_INTERVAL = float(os.environ.get('SPHERE_GW_MIN_INTERVAL', '0.5'))
