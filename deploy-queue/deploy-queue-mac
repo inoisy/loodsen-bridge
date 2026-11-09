@@ -11,7 +11,7 @@ import json, os, subprocess, sys, time, urllib.parse
 
 VPS = os.environ.get("DQ_VPS", "root@<VPS>")
 GLAB = os.environ.get("DQ_GLAB", "/opt/homebrew/bin/glab")
-RP = 936  # <group>/<project>
+RP = 936  # company/svp/project-a/app
 SPHERE = "https://<sphere-host>/company/personal/user/0/tasks/task/view/{}/"
 
 

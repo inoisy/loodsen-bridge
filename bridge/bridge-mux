@@ -15,6 +15,7 @@ TLS-рукопожатие, SSH-баннер или HTTP-ответ сквозь
 порядок users — приоритет. authorized_keys пользователя `bridge` собирается из него же:
     bridge-mux user add <имя> <файл .pub> [--services sphere,kc,git01,dev]   # слот — следующий свободный
     bridge-mux user rm <имя>
+    bridge-mux user services <имя> sphere,kc,git01,dev,time,obs           # сменить набор сервисов
     bridge-mux client <имя> [--format ssh|plist|systemd]                     # что запустить у сотрудника
     bridge-mux status                                                        # слоты и их живость сейчас
 """
@@ -45,6 +46,9 @@ SERVICES = {
     # time-gw-mac живёт только на Маке владельца (пароль Time в его связке ключей) — остальным не нужен.
     'time':   dict(offset=47, listen=['127.0.0.1:18447'],
                    target='127.0.0.1:18490', probe=('http', None)),
+    # obs-gw-mac (Grafana и Sentry Лоции, креды в связке ключей владельца) — тоже только у него.
+    'obs':    dict(offset=48, listen=['127.0.0.1:18448'],
+                   target='127.0.0.1:18491', probe=('http', None)),
 }
 DEFAULT_SERVICES = ['sphere', 'kc', 'git01', 'dev']
 # Старый клиент (до слотов) держит `-R 127.0.0.1:18443 -R 192.168.200.1:18443` → Сфера. Чтобы не ждать,
@@ -289,6 +293,16 @@ def active(cfg, healthy):
     return out
 
 
+def set_services(cfg, name, services):
+    user = next((u for u in cfg['users'] if u['name'] == name), None)
+    if not user: raise ValueError(f'«{name}» нет')
+    if user.get('legacy'): raise ValueError('у старого клиента только Сфера — сначала user legacy off')
+    bad = set(services) - set(SERVICES)
+    if bad: raise ValueError(f'неизвестные сервисы {sorted(bad)}; есть {sorted(SERVICES)}')
+    user['services'] = list(dict.fromkeys(services))
+    return user
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog='bridge-mux', description=__doc__.split('\n')[0])
     sub = p.add_subparsers(dest='cmd', required=True)
@@ -300,6 +314,8 @@ def main(argv=None):
     r = su.add_parser('rm'); r.add_argument('name')
     lg = su.add_parser('legacy', help='старый клиент на 18443 (только Сфера) или назад на слот')
     lg.add_argument('name'); lg.add_argument('state', choices=['on', 'off'])
+    sv = su.add_parser('services', help='сменить сервисы сотрудника (порты слота те же)')
+    sv.add_argument('name'); sv.add_argument('services', help='через запятую, например sphere,kc,git01,dev,time,obs')
     su.add_parser('list')
     c = sub.add_parser('client'); c.add_argument('name')
     c.add_argument('--format', choices=['ssh', 'plist', 'systemd', 'windows'], default='ssh')
@@ -331,6 +347,9 @@ def main(argv=None):
                   ', '.join(f'{s}={user_port(user, s)}' for s in user['services']))
         elif args.op == 'legacy':
             set_legacy(cfg, args.name, args.state == 'on')
+        elif args.op == 'services':
+            user = set_services(cfg, args.name, args.services.split(','))
+            print(f'{user["name"]}: порты', ', '.join(f'{s}={user_port(user, s)}' for s in user['services']))
         else:
             remove_user(cfg, args.name)
     except ValueError as e:

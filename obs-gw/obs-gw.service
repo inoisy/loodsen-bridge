@@ -1,0 +1,19 @@
+[Unit]
+Description=Шлюз наблюдаемости (Grafana, Sentry Лоции): только чтение, через мост с Мака
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=obs-gw
+Group=obs-gw
+ExecStart=/usr/local/bin/obs-gw
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

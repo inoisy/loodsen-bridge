@@ -1,0 +1,92 @@
+#!/usr/bin/python3 -I
+"""Шлюз наблюдаемости на сервере: Grafana (Loki, Prometheus) и Sentry Лоции для агентов, только чтение.
+
+Клиенты (обёртки `grafana` и `sentry`, агенты напрямую) ходят без кредов:
+    http://127.0.0.1:18482/grafana/<stage|prod>/loki/query_range?query=…
+    http://127.0.0.1:18482/grafana/<stage|prod>/prom/query?query=…
+    http://127.0.0.1:18482/sentry/api/0/projects/<org>/project-a/issues/
+    (из контейнера — 192.168.200.1:18482)
+Шлюз идёт в мост с Мака (OBS_UPSTREAM, по умолчанию http://127.0.0.1:18448 → bridge-mux, сервис `obs` →
+obs-gw-mac, который сам подставляет авторизацию; креды Grafana и токен Sentry не покидают Мак). Белый
+список путей держит Мак; здесь — только GET и известные префиксы. Кэша нет: устаревшие логи и метрики
+хуже честного 503 OBS_UNAVAILABLE (Мак спит или вне сети Лоции). Журнал — journalctl -u obs-gw.
+"""
+import json, os, re, sys, threading, time, urllib.error, urllib.parse, urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+UPSTREAM = os.environ.get('OBS_UPSTREAM', 'http://127.0.0.1:18448').rstrip('/')
+LISTEN = os.environ.get('OBS_GW_LISTEN', '127.0.0.1:18482,192.168.200.1:18482')
+TIMEOUT = float(os.environ.get('OBS_GW_TIMEOUT', '70'))
+PREFIX = re.compile(r'^/(grafana/(stage|prod)/(loki|prom|api)/|sentry/api/)')
+ENVELOPE = re.compile(r'^/sentry/api/\d+/envelope/$')  # пропустит, только если разрешено на Маке
+
+
+def allowed(method, path):
+    p = urllib.parse.unquote(urllib.parse.urlsplit(path).path)
+    if '..' in p: return False
+    if method == 'GET': return bool(PREFIX.match(p))
+    return method == 'POST' and bool(ENVELOPE.match(p))
+
+
+class Gateway:
+    def __init__(self, opener=None):
+        self.opener = opener or urllib.request.build_opener()
+
+    def handle(self, method, path, body, ctype):
+        """→ (status, body, source)."""
+        if not allowed(method, path):
+            return 403, b'{"error":"READ_ONLY"}', 'denied'
+        req = urllib.request.Request(UPSTREAM + path, data=body if method == 'POST' else None, method=method,
+                                     headers={'Accept': 'application/json', **({'Content-Type': ctype} if ctype else {})})
+        try:
+            with self.opener.open(req, timeout=TIMEOUT) as r:
+                return r.status, r.read(), 'upstream'
+        except urllib.error.HTTPError as e:
+            return e.code, e.read(), 'upstream'
+        except (urllib.error.URLError, OSError, TimeoutError):
+            return 503, json.dumps({'error': 'OBS_UNAVAILABLE', 'error_description':
+                                    'мост с Мака недоступен (Мак спит или вне сети Лоции) — повторить позже'},
+                                   ensure_ascii=False).encode(), 'error'
+
+
+def make_handler(gw):
+    class H(BaseHTTPRequestHandler):
+        server_version = 'obs-gw'
+
+        def _go(self, method):
+            t = time.monotonic()
+            if self.path == '/health':
+                return self._send(200, b'ok', 'self', t, 'text/plain')
+            if self.path == '/health/upstream':
+                st, data, src = gw.handle('GET', '/grafana/prod/api/health', None, None)
+                return self._send(200 if st == 200 else 503, b'ok' if st == 200 else data, src, t, 'text/plain')
+            n = int(self.headers.get('Content-Length') or 0)
+            st, data, src = gw.handle(method, self.path, self.rfile.read(n) if n else b'', self.headers.get('Content-Type', ''))
+            self._send(st, data, src, t)
+
+        def _send(self, status, data, source, t, ctype='application/json; charset=utf-8'):
+            self.send_response(status); self.send_header('Content-Type', ctype)
+            self.send_header('X-Obs-Gw-Source', source)
+            self.send_header('Content-Length', str(len(data))); self.end_headers(); self.wfile.write(data)
+            print(f'{self.client_address[0]} {self.command} {urllib.parse.urlsplit(self.path).path} {status} {source} '
+                  f'{int((time.monotonic() - t) * 1000)}ms', flush=True)
+
+        def do_GET(self): self._go('GET')
+        def do_POST(self): self._go('POST')
+        def log_message(self, *a): pass
+    return H
+
+
+def main():
+    gw, servers = Gateway(), []
+    for addr in LISTEN.split(','):
+        host, port = addr.rsplit(':', 1)
+        try: servers.append(ThreadingHTTPServer((host, int(port)), make_handler(gw)))
+        except OSError as e: print(f'не слушаю {addr}: {e}', file=sys.stderr, flush=True)
+    if not servers: sys.exit('ни одного адреса')
+    for s in servers[1:]: threading.Thread(target=s.serve_forever, daemon=True).start()
+    print(f'obs-gw: {", ".join(f"{s.server_address[0]}:{s.server_address[1]}" for s in servers)} → {UPSTREAM}', flush=True)
+    servers[0].serve_forever()
+
+
+if __name__ == '__main__': main()

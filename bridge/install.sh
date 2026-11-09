@@ -9,6 +9,11 @@ install -o root -g root -m 755 "$SRC/bridge-mux" /usr/local/bin/bridge-mux
 install -o root -g root -m 644 "$SRC/bridge-mux.service" /etc/systemd/system/bridge-mux.service
 install -o root -g root -m 644 "$SRC/vps/60-bridge.conf" /etc/ssh/sshd_config.d/60-bridge.conf
 sshd -t
+# памятки на диске: /root/BRIDGE.md — первое, что откроет агент с root
+install -d -m 755 /usr/local/share/doc/bridge-mux
+install -o root -g root -m 644 "$SRC/README.md" "$SRC/CONNECT.md" /usr/local/share/doc/bridge-mux/
+install -o root -g root -m 644 "$SRC/BRIDGE.md" /root/BRIDGE.md
+ln -sf /root/BRIDGE.md /usr/local/share/doc/bridge-mux/BRIDGE.md
 [[ -f /etc/bridge-mux.json ]] || { echo '{"users": []}' > /etc/bridge-mux.json; chmod 644 /etc/bridge-mux.json; }
 systemctl daemon-reload
 systemctl reload ssh

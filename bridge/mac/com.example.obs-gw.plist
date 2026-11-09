@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.example.obs-gw</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>-I</string>
+    <string>/Users/<user>/.local/libexec/obs-gw-mac</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- тестовая отправка envelope в Sentry: 1 — разрешить (решает владелец) -->
+    <key>OBS_SENTRY_ENVELOPE</key><string>0</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>15</integer>
+  <key>StandardOutPath</key><string>/Users/<user>/Library/Logs/obs-gw.log</string>
+  <key>StandardErrorPath</key><string>/Users/<user>/Library/Logs/obs-gw.log</string>
+</dict>
+</plist>

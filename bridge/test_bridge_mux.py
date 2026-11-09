@@ -55,6 +55,16 @@ class Users(unittest.TestCase):
         keys = (self.tmp / 'authorized_keys').read_text().splitlines()
         self.assertEqual(len(keys), 2); self.assertTrue(keys[1].endswith('bridge:ilya'))
 
+    def test_cli_services_меняет_набор_и_permitlisten(self):
+        (self.tmp / 'k.pub').write_text(KEY_A + '\n')
+        self.m.main(['user', 'add', 'anna', str(self.tmp / 'k.pub')])
+        self.assertEqual(self.m.main(['user', 'services', 'anna', 'sphere,kc,git01,dev,time,obs']), 0)
+        cfg = json.loads((self.tmp / 'mux.json').read_text())
+        self.assertEqual(cfg['users'][0]['services'], ['sphere', 'kc', 'git01', 'dev', 'time', 'obs'])
+        self.assertIn('permitlisten="127.0.0.1:20148"', (self.tmp / 'authorized_keys').read_text())
+        self.assertEqual(self.m.main(['user', 'services', 'anna', 'sphere,ftp']), 1)
+        self.assertEqual(self.m.main(['user', 'services', 'nobody', 'sphere']), 1)
+
     def test_клиент_пробрасывает_свои_порты(self):
         user = {'name': 'petr', 'slot': 2, 'key': KEY_B, 'services': ['sphere', 'dev']}
         cmd = self.m.render_client(user, 'ssh', '~/.ssh/k')

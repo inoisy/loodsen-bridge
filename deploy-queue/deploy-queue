@@ -20,7 +20,7 @@ DIR = os.environ.get("DQ_DIR", "/var/lib/deploy-queue")
 GIT = os.environ.get("DQ_GIT", "/usr/bin/git")
 GIT01 = os.environ.get("DQ_GIT01", "git@<git01-host>:{project}.git")
 RP_REPO = os.environ.get("DQ_RP_REPO", "/home/agents/resource-planning/service")
-RP_PROJECT = "<group>/<project>"
+RP_PROJECT = "company/svp/project-a/app"
 BASE = re.compile(r"^(main|master|dev|develop|stage|prod|release/.*)$")
 
 

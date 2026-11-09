@@ -25,6 +25,7 @@ dev-контур `*.<dev-domain>` доступны ему только чере�
 | `git01` | 22 | `127.0.0.1:18422` | `<git01-host>:22` |
 | `dev` | 50 | `192.168.200.1:18450` | `<internal-ip>:443` |
 | `time` | 47 | `127.0.0.1:18447` | `127.0.0.1:18490`: `time-gw-mac`, есть только у владельца |
+| `obs` | 48 | `127.0.0.1:18448` (`obs-gw`) | `127.0.0.1:18491`: `obs-gw-mac` (Grafana, Sentry), есть только у владельца |
 
 Постоянные адреса `kc`, `git01`, `dev` и `time` не изменились, поэтому `ssh_config` для git01,
 `kc-bridge-nat` и `dev-bridge-nat` не трогали. У Сферы bridge-mux слушает `18543`: на этот порт ходит
@@ -86,7 +87,9 @@ SSH-баннер для `git01`, HTTP-ответ для `time`. Слот, у к�
 | `vps/kc-bridge-nat.service`, `vps/dev-bridge-nat.service` | VPS, `/etc/systemd/system/` | DNAT Keycloak и dev-контура на постоянные порты bridge-mux |
 | `mac/com.example.sphere-bridge.plist` | Мак владельца, `~/Library/LaunchAgents` | туннель слота 2 (`evgeniy`) |
 | `mac/com.example.time-gw.plist` | Мак владельца | запускает `time-gw/time-gw-mac` |
-| `CONNECT.md` | — | памятка сотруднику, который держит мост |
+| `mac/com.example.obs-gw.plist` | Мак владельца | запускает `~/.local/libexec/obs-gw-mac` (ставит `obs-gw/install-mac.sh`) |
+| `CONNECT.md` | VPS, `/usr/local/share/doc/bridge-mux/` | памятка сотруднику, который держит мост |
+| `BRIDGE.md` | VPS, `/root/BRIDGE.md` | шпаргалка для того, кто зашёл на сервер: статус, перевод сотрудника на слот, новый человек |
 
 Остальной код моста лежит в соседних каталогах: `sphere-gw/` (шлюз Сферы), `time-gw/` (шлюз Time),
 `deploy-queue/` (очередь проливки). Устройство — `docs/ops.md`, раздел про мост.

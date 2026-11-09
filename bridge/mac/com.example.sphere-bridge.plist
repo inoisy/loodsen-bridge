@@ -19,6 +19,7 @@
     <string>-R</string><string>127.0.0.1:20222:<git01-host>:22</string>
     <string>-R</string><string>127.0.0.1:20250:<internal-ip>:443</string>
     <string>-R</string><string>127.0.0.1:20247:127.0.0.1:18490</string>
+    <string>-R</string><string>127.0.0.1:20248:127.0.0.1:18491</string>
     <string>bridge@<VPS></string>
   </array>
   <key>RunAtLoad</key><true/>

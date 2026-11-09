@@ -1,0 +1,213 @@
+#!/usr/bin/python3 -I
+"""Шлюз наблюдаемости на Маке владельца: Grafana и Sentry Лоции для агентов, креды не покидают Мак.
+
+Слушает 127.0.0.1:18491; мост (launchd com.example.sphere-bridge, сервис `obs` в bridge-mux) отдаёт его
+серверу как 127.0.0.1:18448, где его читает серверный obs-gw. Здесь:
+- только чтение — белый список ниже, всё прочее 403 READ_ONLY;
+- Grafana (stage, prod): basic auth учёткой из связки ключей (`security … -s grafana-stage-company`),
+  Loki и Prometheus — через прокси датасорса, плюс чтение дашбордов и правил алертов;
+- Sentry (<internal-host>): Bearer-токен из связки (`security … -s sentry-company -a agents`), только
+  проекты из SENTRY_PROJECTS — токен видит всю организацию;
+- тестовая отправка envelope в Sentry выключена; включает владелец: OBS_SENTRY_ENVELOPE=1 в plist.
+
+Пути (клиент — серверный obs-gw):
+  GET /grafana/<stage|prod>/loki/<query|query_range|labels|label/<имя>/values|series|index/stats>
+  GET /grafana/<stage|prod>/prom/<query|query_range|labels|label/<имя>/values|series|metadata|rules|alerts>
+  GET /grafana/<stage|prod>/api/<search|dashboards/uid/<uid>|folders|datasources|…>   (список GRAFANA_API)
+  GET /sentry/api/0/<projects/…|issues/<id>/…|organizations/<org>/…>                  (см. sentry_allowed)
+  POST /sentry/api/<id проекта>/envelope/   — только при OBS_SENTRY_ENVELOPE=1
+"""
+import base64, json, os, re, subprocess, threading, time, urllib.error, urllib.parse, urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+LISTEN = ('127.0.0.1', int(os.environ.get('OBS_GW_MAC_PORT', '18491')))
+GRAFANA = {
+    'stage': {'host': 'https://<internal-host>', 'loki': '<datasource-uid>', 'prom': '<datasource-uid>'},
+    'prod': {'host': 'https://<internal-host>', 'loki': '<datasource-uid>', 'prom': '<datasource-uid>'},
+}
+SENTRY = os.environ.get('OBS_SENTRY_HOST', 'https://<internal-host>')
+SENTRY_PROJECTS = set(filter(None, os.environ.get('OBS_SENTRY_PROJECTS', 'project-a,project-b').split(',')))
+ENVELOPE = os.environ.get('OBS_SENTRY_ENVELOPE') == '1'
+TIMEOUT = 60
+
+LOKI_API = re.compile(r'^(query|query_range|labels|label/[A-Za-z0-9_]+/values|series|index/stats)$')
+PROM_API = re.compile(r'^(query|query_range|labels|label/[A-Za-z0-9_:]+/values|series|metadata|rules|alerts)$')
+GRAFANA_API = re.compile(r'^(search|folders|datasources|health|dashboards/uid/[A-Za-z0-9_-]+'
+                         r'|v1/provisioning/alert-rules(/[A-Za-z0-9_-]+)?'
+                         r'|prometheus/grafana/api/v1/(rules|alerts)'
+                         r'|alertmanager/grafana/api/v2/alerts)$')
+SLUG = r'[A-Za-z0-9_.-]+'
+S_PROJECT = re.compile(rf'^/api/0/projects/({SLUG})/({SLUG})/((issues|events|stats|environments|tags|releases)/([A-Za-z0-9_./:-]*))?$')
+S_ISSUE = re.compile(rf'^/api/0/(organizations/{SLUG}/)?issues/(\d+)/((events|tags|hashes)/([A-Za-z0-9_./:-]*))?$')
+S_ORG_EVENTS = re.compile(rf'^/api/0/organizations/({SLUG})/(events|events-stats)/$')
+S_PROJECT_LISTS = re.compile(rf'^/api/0/(projects|organizations/{SLUG}/projects)/$')
+S_ENVELOPE = re.compile(r'^/api/(\d+)/envelope/$')
+
+
+def keychain(service, account=None, secret=True):
+    cmd = ['/usr/bin/security', 'find-generic-password', '-s', service] + (['-a', account] if account else []) + (['-w'] if secret else [])
+    out = subprocess.run(cmd, capture_output=True, text=True)
+    if out.returncode:
+        raise LookupError(f'в связке ключей нет {service}')
+    if secret:
+        return out.stdout.strip()
+    m = re.search(r'"acct"<blob>="([^"]*)"', out.stdout)
+    return m.group(1) if m else ''
+
+
+class Secrets:
+    """Креды читаются из связки при первом запросе и держатся в памяти 10 мин (смена пароля подхватится сама)."""
+    def __init__(self, grafana=None, sentry=None):
+        self._g, self._s, self.lock, self.at = grafana, sentry, threading.Lock(), {}
+        self.cache = {}
+
+    def _get(self, key, load):
+        with self.lock:
+            if key not in self.cache or time.monotonic() - self.at[key] > 600:
+                self.cache[key], self.at[key] = load(), time.monotonic()
+            return self.cache[key]
+
+    def grafana(self):
+        if self._g: return self._g()
+        return self._get('g', lambda: 'Basic ' + base64.b64encode(
+            f"{keychain('grafana-stage-company', secret=False)}:{keychain('grafana-stage-company')}".encode()).decode())
+
+    def sentry(self):
+        if self._s: return self._s()
+        return self._get('s', lambda: 'Bearer ' + keychain('sentry-company', 'agents'))
+
+
+def grafana_target(path):
+    """/grafana/<env>/<kind>/<api> → URL Grafana или None."""
+    m = re.match(r'^/grafana/(stage|prod)/(loki|prom|api)/(.+)$', path)
+    if not m: return None
+    env, kind, api = GRAFANA[m.group(1)], m.group(2), m.group(3)
+    if kind == 'loki' and LOKI_API.match(api):
+        return f"{env['host']}/api/datasources/proxy/uid/{env['loki']}/loki/api/v1/{api}"
+    if kind == 'prom' and PROM_API.match(api):
+        return f"{env['host']}/api/datasources/proxy/uid/{env['prom']}/api/v1/{api}"
+    if kind == 'api' and GRAFANA_API.match(api):
+        return f"{env['host']}/api/{api}"
+    return None
+
+
+class Sentry:
+    def __init__(self, fetch):
+        self.fetch = fetch  # fetch(path_with_query) -> (status, bytes)
+        self.issue_project, self.projects, self.projects_at = {}, None, 0.0
+
+    def project_ids(self):
+        if self.projects is None or time.monotonic() - self.projects_at > 600:
+            st, body = self.fetch('/api/0/projects/')
+            if st != 200: return {}
+            self.projects = {str(p['id']): p['slug'] for p in json.loads(body) if p.get('slug') in SENTRY_PROJECTS}
+            self.projects_at = time.monotonic()
+        return self.projects
+
+    def issue_allowed(self, issue_id):
+        if issue_id not in self.issue_project:
+            st, body = self.fetch(f'/api/0/issues/{issue_id}/')
+            if st != 200: return st
+            self.issue_project[issue_id] = (json.loads(body).get('project') or {}).get('slug')
+        return self.issue_project[issue_id] in SENTRY_PROJECTS
+
+    def check(self, method, path, query):
+        """→ (решение, причина): 'pass' | 'filter' (ответ — список проектов, отфильтровать) | 'deny' | <код ошибки>."""
+        if method == 'POST':
+            m = S_ENVELOPE.match(path)
+            if m and ENVELOPE and m.group(1) in self.project_ids(): return 'envelope'
+            return 'deny'
+        if method != 'GET': return 'deny'
+        if S_PROJECT_LISTS.match(path): return 'filter'
+        m = S_PROJECT.match(path)
+        if m: return 'pass' if m.group(2) in SENTRY_PROJECTS else 'deny'
+        m = S_ISSUE.match(path)
+        if m:
+            ok = self.issue_allowed(m.group(2))
+            return 'pass' if ok is True else ('deny' if ok is False else ok)
+        if S_ORG_EVENTS.match(path):
+            ids = urllib.parse.parse_qs(query).get('project', [])
+            allowed = self.project_ids()
+            return 'pass' if ids and all(i in allowed for i in ids) else 'deny'
+        return 'deny'
+
+
+def clean(path):
+    """Путь без запроса; None — если в нём обход каталогов или мусор."""
+    p = urllib.parse.urlsplit(path)
+    raw = urllib.parse.unquote(p.path)
+    if '..' in raw or '//' in raw or '\\' in raw: return None, None
+    return p.path, p.query
+
+
+def make_handler(secrets, opener=None):
+    opener = opener or urllib.request.build_opener()
+
+    def fetch(url, auth, method='GET', body=None, ctype=None):
+        req = urllib.request.Request(url, data=body, method=method,
+                                     headers={'Authorization': auth, 'Accept': 'application/json',
+                                              **({'Content-Type': ctype} if ctype else {})})
+        try:
+            with opener.open(req, timeout=TIMEOUT) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    def sentry_fetch(path_q):
+        return fetch(SENTRY + path_q, secrets.sentry())
+
+    sentry = Sentry(sentry_fetch)
+
+    class H(BaseHTTPRequestHandler):
+        server_version = 'obs-gw-mac'
+
+        def _go(self, method):
+            n = int(self.headers.get('Content-Length') or 0)
+            body = self.rfile.read(n) if n else None
+            path, query = clean(self.path)
+            if path is None:
+                return self._send(403, b'{"error":"READ_ONLY"}')
+            if path == '/health' or path == '/':
+                return self._send(200, b'{"ok":true}')
+            try:
+                if path.startswith('/grafana/'):
+                    url = grafana_target(path) if method == 'GET' else None
+                    if not url: return self._send(403, b'{"error":"READ_ONLY"}')
+                    return self._send(*fetch(url + ('?' + query if query else ''), secrets.grafana()))
+                if path.startswith('/sentry/'):
+                    spath = path[len('/sentry'):]
+                    verdict = sentry.check(method, spath, query)
+                    if verdict == 'deny': return self._send(403, b'{"error":"READ_ONLY_OR_FOREIGN_PROJECT"}')
+                    if isinstance(verdict, int): return self._send(verdict, b'{"error":"SENTRY_ERROR"}')
+                    if verdict == 'envelope':
+                        return self._send(*fetch(SENTRY + spath + ('?' + query if query else ''), secrets.sentry(),
+                                                 'POST', body, self.headers.get('Content-Type') or 'application/x-sentry-envelope'))
+                    st, data = sentry_fetch(spath + ('?' + query if query else ''))
+                    if verdict == 'filter' and st == 200:
+                        data = json.dumps([p for p in json.loads(data) if p.get('slug') in SENTRY_PROJECTS], ensure_ascii=False).encode()
+                    return self._send(st, data)
+                return self._send(404, b'{"error":"NOT_FOUND"}')
+            except LookupError as e:
+                return self._send(503, json.dumps({'error': 'NO_CREDENTIALS', 'error_description': str(e)}, ensure_ascii=False).encode())
+            except (urllib.error.URLError, OSError, TimeoutError):
+                return self._send(502, b'{"error":"UPSTREAM_UNREACHABLE"}')
+
+        def _send(self, status, data):
+            self.send_response(status); self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(data))); self.end_headers()
+            if self.command != 'HEAD': self.wfile.write(data)
+            print(f'{time.strftime("%Y-%m-%d %H:%M:%S")} {self.command} {urllib.parse.urlsplit(self.path).path} {status}', flush=True)
+
+        def do_GET(self): self._go('GET')
+        def do_POST(self): self._go('POST')
+        def do_HEAD(self): self._send(200, b'')  # проба живости bridge-mux
+        def do_PUT(self): self._send(403, b'{"error":"READ_ONLY"}')
+        def do_DELETE(self): self._send(403, b'{"error":"READ_ONLY"}')
+        def do_PATCH(self): self._send(403, b'{"error":"READ_ONLY"}')
+        def log_message(self, *a): pass
+    return H
+
+
+if __name__ == '__main__':
+    print(f'obs-gw-mac: {LISTEN[0]}:{LISTEN[1]}, проекты Sentry: {",".join(sorted(SENTRY_PROJECTS))}, envelope: {"да" if ENVELOPE else "нет"}', flush=True)
+    ThreadingHTTPServer(LISTEN, make_handler(Secrets())).serve_forever()
